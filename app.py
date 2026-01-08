@@ -1,495 +1,441 @@
-import streamlit as st
 import math
+from typing import Optional, List, Dict
 
-# ---------- Helpers ----------
+import streamlit as st
+import pandas as pd
 
-def parse_time_to_minutes(time_str: str) -> float:
+
+# ---------- Utility functions ----------
+
+def parse_time_to_min(time_str: str) -> Optional[float]:
     """
-    Parse a time string into minutes.
-    Accepts: "mm:ss", "hh:mm:ss", or "mm".
-    Returns None if parsing fails.
+    Parse 'mm:ss' or 'h:mm:ss' into minutes (float).
+    Returns None if empty or invalid.
     """
     if not time_str:
         return None
-
-    time_str = time_str.strip()
-    parts = time_str.split(":")
-
     try:
-        if len(parts) == 3:
-            h, m, s = map(int, parts)
-        elif len(parts) == 2:
+        parts = [int(p) for p in time_str.strip().split(":")]
+        if len(parts) == 2:
+            m, s = parts
             h = 0
-            m, s = map(int, parts)
-        elif len(parts) == 1:
-            h = 0
-            m = int(parts[0])
-            s = 0
+        elif len(parts) == 3:
+            h, m, s = parts
         else:
             return None
-    except ValueError:
+        return h * 60 + m + s / 60.0
+    except Exception:
         return None
 
-    total_minutes = h * 60 + m + s / 60.0
-    return total_minutes
 
-
-def minutes_to_hms_str(minutes: float) -> str:
-    """
-    Convert minutes (float) to "h:mm:ss".
-    """
-    if minutes is None or math.isnan(minutes):
-        return "—"
+def format_min_to_hms(minutes: float) -> str:
     total_seconds = int(round(minutes * 60))
     h = total_seconds // 3600
-    rem = total_seconds % 3600
-    m = rem // 60
-    s = rem % 60
-    return f"{h}:{m:02d}:{s:02d}"
-
-
-def minutes_per_km_to_pace_str(min_per_km: float) -> str:
-    """
-    Convert minutes/km to "m:ss /km".
-    """
-    if min_per_km is None or min_per_km <= 0:
-        return "—"
-    total_seconds = int(round(min_per_km * 60))
-    m = total_seconds // 60
+    m = (total_seconds % 3600) // 60
     s = total_seconds % 60
-    return f"{m}:{s:02d} /km"
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
 
 
-# ---------- Core models ----------
+def speed_from_time(distance_km: float, time_min: float) -> float:
+    """km/h given km and minutes."""
+    return distance_km / (time_min / 60.0)
 
-def estimate_df_personal(ats: float,
-                         t10k_actual_min: float,
-                         t10k_pred_min: float,
-                         annual_elev_m: float) -> float:
+
+def pace_from_speed(speed_kmh: float) -> float:
+    """Return pace in min/km from speed (km/h)."""
+    return 60.0 / speed_kmh
+
+
+def format_pace(pace_min_per_km: float) -> str:
+    m = int(pace_min_per_km)
+    s = int(round((pace_min_per_km - m) * 60))
+    if s == 60:
+        m += 1
+        s = 0
+    return f"{m:d}:{s:02d} /km"
+
+
+# ---------- Durability & marathon model ----------
+
+def estimate_df_from_decay_and_volume(
+    ten_k_min: Optional[float],
+    marathon_min: Optional[float],
+    annual_km: float,
+) -> float:
     """
-    Personal durability factor (DF) model:
+    DF combines:
+    1) 10K -> Marathon decay (base durability)
+    2) Annual volume effect around an 'ideal' 6000 km/year
 
-    DF = 1.768 - 0.049 * ATS - 0.0000069 * Elev_year + 0.118 * Gap_10k
+    - DF ~ 1.0 is 'typical'
+    - DF > 1.0 = more durable (less slowdown, higher chance of negative split)
+    - DF < 1.0 = less durable (bigger fade)
 
-    where Gap_10k = (T10_actual - T10_pred) / T10_pred
+    We clamp to [0.75, 1.30] to avoid wild values.
     """
-    if ats is None or ats <= 0:
-        return None
-    if t10k_actual_min is None or t10k_pred_min is None or t10k_pred_min <= 0:
-        return None
-    if annual_elev_m is None:
-        annual_elev_m = 0.0
+    # 1. Base from 10K→marathon decay, if both are available
+    if ten_k_min is not None and marathon_min is not None:
+        # Riegel-style prediction of marathon from 10K
+        riegel_exp = 1.06
+        dist_ratio = 42.195 / 10.0
+        predicted_mar_min = ten_k_min * (dist_ratio ** riegel_exp)
 
-    gap_10k = (t10k_actual_min - t10k_pred_min) / t10k_pred_min
+        decay_ratio = marathon_min / predicted_mar_min  # >1 means slower than Riegel
+        # Assume a "typical" good marathoner has decay_ratio ≈ 1.08
+        typical_decay = 1.08
 
-    df = (
-        1.768
-        - 0.049 * ats
-        - 0.0000069 * annual_elev_m
-        + 0.118 * gap_10k
-    )
+        # Map decay_ratio to DF_base: 1.08 -> 1.00
+        # If decay is 0.10 worse (1.18), DF ≈ 0.85, if 0.10 better (0.98), DF ≈ 1.15
+        k = 1.5
+        df_base = 1.0 + (typical_decay - decay_ratio) * k
+    else:
+        # If we don't know the decay, start neutral
+        df_base = 1.0
 
-    # Clamp DF into a plausible range
-    df = max(0.80, min(1.20, df))
+    # 2. Volume factor around 6000 km/year
+    ideal_km = 6000.0
+    vol_ratio = annual_km / ideal_km
+    # For most runners:
+    #   ~3000 km -> ~-7.5% DF
+    #   ~6000 km -> neutral
+    #   ~9000–10000 km (Kelvin-esque) -> +7–10% DF
+    vol_factor = 1.0 + 0.15 * (vol_ratio - 1.0)
+
+    df = df_base * vol_factor
+
+    # Clamp
+    df = max(0.75, min(1.30, df))
     return df
 
 
-def predict_marathon_time_minutes(ats: float, df: float) -> float:
+def marathon_time_from_ats_df(ats_kmh: float, df: float) -> float:
     """
-    Your marathon prediction model:
+    Marathon prediction in MINUTES from ATS (km/h) and DF.
 
-    MPT (min) = (4666 * ATS^(-1.33) / DF) + 8
+    ATS is ~70% of performance,
+    DF (durability) explains the remaining ~30%.
+
+    MPT (min) = (4666 * ATS^-1.33) / DF + 8
     """
-    if ats is None or ats <= 0 or df is None or df <= 0:
-        return None
-    base = 4666.0 * (ats ** -1.33)
-    mpt = base / df + 8.0
-    return mpt
+    base = 4666.0 * (ats_kmh ** -1.33)
+    return base / df + 8.0
 
 
-# ---------- Zone classification ----------
+# ---------- Plan templates ----------
 
-def classify_zone(pace_min_per_km: float,
-                  mp_pace_min_per_km: float) -> str:
+PLAN_TEMPLATES: Dict[str, List[Dict]] = {
+    # Distances are percentages of weekly_km
+    # zone: Z1 (easy), Z2 (steady), Z3 (MP/sub-threshold),
+    #       Z4 (threshold), Z5 (intervals)
+    "Pfitzinger": [
+        {"day": "Mon", "name": "Recovery", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Tue", "name": "LT / Tempo", "zone": "Z4", "dist_pct": 0.15},
+        {"day": "Wed", "name": "Medium Long", "zone": "Z2", "dist_pct": 0.18},
+        {"day": "Thu", "name": "Recovery", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Fri", "name": "General Aerobic", "zone": "Z2", "dist_pct": 0.12},
+        {"day": "Sat", "name": "VO₂ / Intervals", "zone": "Z5", "dist_pct": 0.10},
+        {"day": "Sun", "name": "Long Run (with MP finish)", "zone": "Z2_Z3", "dist_pct": 0.25},
+    ],
+    "Daniels": [
+        {"day": "Mon", "name": "Easy + strides", "zone": "Z1", "dist_pct": 0.12},
+        {"day": "Tue", "name": "Threshold (T) session", "zone": "Z4", "dist_pct": 0.16},
+        {"day": "Wed", "name": "Medium Long", "zone": "Z2", "dist_pct": 0.18},
+        {"day": "Thu", "name": "Easy", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Fri", "name": "Intervals (I) / VO₂", "zone": "Z5", "dist_pct": 0.14},
+        {"day": "Sat", "name": "Easy", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Sun", "name": "Long Run", "zone": "Z2_Z3", "dist_pct": 0.20},
+    ],
+    "Canova": [
+        {"day": "Mon", "name": "Easy regeneration", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Tue", "name": "Specific Marathon (MP + fast finish)", "zone": "Z3_Z4", "dist_pct": 0.20},
+        {"day": "Wed", "name": "Medium Long easy", "zone": "Z2", "dist_pct": 0.18},
+        {"day": "Thu", "name": "Easy", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Fri", "name": "Special Block / Alternations", "zone": "Z3_Z4", "dist_pct": 0.17},
+        {"day": "Sat", "name": "Easy", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Sun", "name": "Long Run with segments at MP", "zone": "Z2_Z3", "dist_pct": 0.15},
+    ],
+    "Tinman": [
+        {"day": "Mon", "name": "Easy", "zone": "Z1", "dist_pct": 0.14},
+        {"day": "Tue", "name": "Cruise Intervals (CV)", "zone": "Z4", "dist_pct": 0.16},
+        {"day": "Wed", "name": "Easy", "zone": "Z1", "dist_pct": 0.14},
+        {"day": "Thu", "name": "Tempo / Steady", "zone": "Z3", "dist_pct": 0.16},
+        {"day": "Fri", "name": "Easy", "zone": "Z1", "dist_pct": 0.10},
+        {"day": "Sat", "name": "Short Intervals / Speed", "zone": "Z5", "dist_pct": 0.10},
+        {"day": "Sun", "name": "Long Run", "zone": "Z2_Z3", "dist_pct": 0.20},
+    ],
+}
+
+
+def zone_speed_from_mp(mp_speed: float, zone: str) -> float:
     """
-    Classify a pace into Z1–Z5 based on % of marathon-pace speed.
-
-    - Z1: < 85% MP speed (easy / recovery)
-    - Z2: 85–95% MP speed (steady / aerobic)
-    - Z3: 95–105% MP speed (MP / sub-threshold)
-    - Z4: 105–115% MP speed (threshold / CV band)
-    - Z5: > 115% MP speed (faster than threshold)
+    Return target speed in km/h for a given zone,
+    as a percentage of marathon-pace speed.
     """
-    if pace_min_per_km is None or pace_min_per_km <= 0:
-        return None
-    if mp_pace_min_per_km is None or mp_pace_min_per_km <= 0:
-        return None
-
-    # Convert paces to speeds
-    v_mp = 60.0 / mp_pace_min_per_km
-    v = 60.0 / pace_min_per_km
-    ratio = v / v_mp  # 1.0 = MP, >1 faster than MP, <1 slower than MP
-
-    if ratio < 0.85:
-        return "Z1"
-    elif ratio < 0.95:
-        return "Z2"
-    elif ratio < 1.05:
-        return "Z3"
-    elif ratio < 1.15:
-        return "Z4"
+    if zone == "Z1":
+        factor = 0.78   # easy / recovery
+    elif zone == "Z2":
+        factor = 0.88   # steady aerobic
+    elif zone == "Z3":
+        factor = 0.98   # MP / slightly faster
+    elif zone == "Z4":
+        factor = 1.08   # threshold / CV
+    elif zone == "Z5":
+        factor = 1.18   # faster than threshold
+    elif zone == "Z2_Z3":
+        factor = 0.93   # blend of Z2 & Z3
+    elif zone == "Z3_Z4":
+        factor = 1.03   # blend of Z3 & Z4
     else:
-        return "Z5"
+        factor = 0.88
+    return mp_speed * factor
+
+
+def expand_plan(
+    plan_name: str,
+    weekly_km: float,
+    mp_speed: float,
+) -> pd.DataFrame:
+    rows = []
+    template = PLAN_TEMPLATES[plan_name]
+
+    for block in template:
+        dist_km = weekly_km * block["dist_pct"]
+        # If it's a mixed zone, we still assign one "headline" pace
+        z = block["zone"]
+        spd = zone_speed_from_mp(mp_speed, z)
+        pace = pace_from_speed(spd)
+        rows.append(
+            {
+                "Day": block["day"],
+                "Workout": block["name"],
+                "Zone": z,
+                "Distance_km": round(dist_km, 1),
+                "Target_pace": format_pace(pace),
+                "Target_speed_kmh": round(spd, 2),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def compute_weekly_ats(df: pd.DataFrame) -> float:
+    """Distance-weighted ATS for the generated week."""
+    total_km = df["Distance_km"].sum()
+    if total_km == 0:
+        return 0.0
+    # Use 60 / pace_min_per_km via parsing 'm:ss /km'
+    speeds = []
+    for _, row in df.iterrows():
+        pace_str = row["Target_pace"].split()[0]  # 'm:ss'
+        pace_min = parse_time_to_min(pace_str)
+        if pace_min is None or pace_min <= 0:
+            continue
+        speeds.append(speed_from_time(row["Distance_km"], row["Distance_km"] * pace_min))
+    # If everything went fine, weighted speed is just sum(distance)/sum(time)
+    total_time_h = 0.0
+    for _, row in df.iterrows():
+        pace_str = row["Target_pace"].split()[0]
+        pace_min = parse_time_to_min(pace_str)
+        if pace_min is None or pace_min <= 0:
+            continue
+        time_h = row["Distance_km"] * pace_min / 60.0
+        total_time_h += time_h
+    if total_time_h == 0:
+        return 0.0
+    ats = df["Distance_km"].sum() / total_time_h
+    return ats
+
+
+def summarize_zones(df: pd.DataFrame) -> pd.DataFrame:
+    zone_km = {}
+    for _, row in df.iterrows():
+        z = row["Zone"]
+        km = row["Distance_km"]
+        # Split mixed zones evenly
+        if z in ("Z2_Z3", "Z3_Z4"):
+            parts = z.split("_")
+            for part in parts:
+                zone_km[part] = zone_km.get(part, 0.0) + km * 0.5
+        else:
+            zone_km[z] = zone_km.get(z, 0.0) + km
+
+    rows = []
+    total = sum(zone_km.values())
+    for z in sorted(zone_km.keys()):
+        pct = 100.0 * zone_km[z] / total if total > 0 else 0
+        desc = {
+            "Z1": "Easy / Recovery",
+            "Z2": "Steady Aerobic",
+            "Z3": "Marathon / Sub-threshold",
+            "Z4": "Threshold / CV",
+            "Z5": "Intervals / Speed",
+        }.get(z, "")
+        rows.append(
+            {
+                "Zone": z,
+                "Description": desc,
+                "km": round(zone_km[z], 1),
+                "% of week": round(pct, 1),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 # ---------- Streamlit UI ----------
 
-st.set_page_config(page_title="Marathon ATS + Durability Planner", layout="centered")
-
-st.title("🏃‍♂️ Marathon ATS + Durability Planner (with Zones)")
+st.title("Marathon ATS + Durability Planner (Simplified)")
 
 st.markdown(
     """
-This app lets you **play with training inputs** and see their impact on:
+This tool builds a **weekly marathon training template** for you from a classic program
+(**Pfitzinger, Daniels, Canova, Tinman**) and your own metrics.
 
-- **ATS** (Average Training Speed, km/h)  
-- **DF** (Durability Factor, via your personal model)  
-- **Predicted marathon time**  
-- **km in each intensity zone (Z1–Z5)** relative to Marathon Pace
-
-Marathon model:
-
-> **MPT (min) = (4666 · ATS⁻¹·³³ / DF) + 8**
+We treat:
+- **ATS (Average Training Speed)** as ~**70%** of marathon performance  
+- **DF (Durability Factor)** as the remaining **30%**: how well you *hold* your speed into the marathon  
 """
 )
 
-# ---------- SIDEBAR: Weekly + global inputs ----------
+st.sidebar.header("1. Recent Performances & Volume")
 
-st.sidebar.header("1️⃣ Weekly Training Inputs (Manual)")
+ten_k_str = st.sidebar.text_input("Recent 10K time (mm:ss or h:mm:ss)", value="41:32")
+marathon_str = st.sidebar.text_input(
+    "Recent marathon time (optional, mm:ss or h:mm:ss)", value=""
+)
+annual_km = st.sidebar.number_input("Annual volume (km/year)", min_value=500, max_value=12000, value=4300, step=100)
 
-col_km, col_hrs = st.sidebar.columns(2)
-with col_km:
-    weekly_km = st.number_input("Weekly km", min_value=0.0, value=80.0, step=1.0)
-with col_hrs:
-    weekly_hours = st.number_input("Weekly hours", min_value=0.1, value=6.0, step=0.25)
+ten_k_min = parse_time_to_min(ten_k_str)
+marathon_min = parse_time_to_min(marathon_str) if marathon_str else None
 
-ats_from_week = weekly_km / weekly_hours if weekly_hours > 0 else None
+if ten_k_min is None:
+    st.error("Please enter a valid 10K time (mm:ss or h:mm:ss).")
+    st.stop()
+
+ten_k_speed = speed_from_time(10.0, ten_k_min)
+ten_k_pace = pace_from_speed(ten_k_speed)
+
 st.sidebar.markdown(
-    f"**ATS from week:** {ats_from_week:.2f} km/h"
-    if ats_from_week
-    else "**ATS from week:** —"
+    f"**10K pace**: `{format_pace(ten_k_pace)}`  \n"
+    f"**10K speed**: `{ten_k_speed:.2f} km/h`"
 )
 
-ats = st.sidebar.number_input(
-    "ATS used in manual scenario (km/h)",
-    min_value=5.0,
-    max_value=20.0,
-    value=float(round(ats_from_week or 12.0, 2)),
+st.sidebar.header("2. Target Training Level")
+
+plan_name = st.sidebar.selectbox(
+    "Select training program",
+    ["Pfitzinger", "Daniels", "Canova", "Tinman"],
+)
+
+weekly_km = st.sidebar.slider(
+    "Target weekly distance (km)",
+    min_value=60,
+    max_value=180,
+    value=112,
+    step=2,
+)
+
+target_ats = st.sidebar.slider(
+    "Target ATS for this phase (km/h)",
+    min_value=10.0,
+    max_value=16.0,
+    value=13.2,
     step=0.1,
 )
 
-st.sidebar.header("2️⃣ Marathon Pace & Threshold")
+# Durability from decay + volume
+df_est = estimate_df_from_decay_and_volume(ten_k_min, marathon_min, annual_km)
 
-mp_pace_str = st.sidebar.text_input(
-    "Target marathon pace (min/km)",
-    value="4:15",  # ~2:59:xx MP-ish
-)
-lt_pace_str = st.sidebar.text_input(
-    "Threshold pace (min/km) (for reference)",
-    value="3:55",
-)
-
-mp_pace_minpkm = parse_time_to_minutes(mp_pace_str)
-lt_pace_minpkm = parse_time_to_minutes(lt_pace_str)
+st.sidebar.header("3. ATS + DF Model")
 
 st.sidebar.markdown(
-    f"- MP speed ≈ **{60/mp_pace_minpkm:.2f} km/h**" if mp_pace_minpkm else "- MP speed: —"
-)
-st.sidebar.markdown(
-    f"- LT speed ≈ **{60/lt_pace_minpkm:.2f} km/h**" if lt_pace_minpkm else "- LT speed: —"
-)
-
-st.sidebar.header("3️⃣ Personal Durability (DF) Inputs")
-
-st.sidebar.markdown(
-    """
-DF is estimated from:  
-- **ATS**  
-- **10K actual vs predicted**, and  
-- **Annual elevation gain**
+    f"""
+- **Estimated DF**: `{df_est:.3f}`  
+- **Interpretation**:  
+  - `~1.00` = typical durability  
+  - `>1.00` = very durable, likely to **hold pace / negative split**  
+  - `<1.00` = more fade risk, marathon time drifts slower  
 """
 )
 
-t10k_actual_str = st.sidebar.text_input("Actual 10K time (mm:ss or hh:mm:ss)", value="41:32")
-t10k_pred_str = st.sidebar.text_input("Predicted 10K time (e.g. VDOT)", value="37:48")
-annual_elev_m = st.sidebar.number_input(
-    "Annual elevation gain (m)",
-    min_value=0.0,
-    value=20000.0,
-    step=500.0,
-)
+predicted_mar_min = marathon_time_from_ats_df(target_ats, df_est)
+predicted_mar_pace = pace_from_speed(42.195 / (predicted_mar_min / 60.0))
 
-t10k_actual_min = parse_time_to_minutes(t10k_actual_str)
-t10k_pred_min = parse_time_to_minutes(t10k_pred_str)
-
-df_est_manual = estimate_df_personal(ats, t10k_actual_min, t10k_pred_min, annual_elev_m)
-
-manual_df_override = st.sidebar.number_input(
-    "Optional: override DF (manual)",
-    min_value=0.80,
-    max_value=1.20,
-    value=float(df_est_manual if df_est_manual is not None else 1.03),
-    step=0.01,
-)
-
-use_manual_df = st.sidebar.checkbox("Use manual DF override", value=False)
-
-df_used_manual = manual_df_override if use_manual_df or df_est_manual is None else df_est_manual
-
-st.sidebar.markdown(f"**DF (manual scenario):** {df_used_manual:.3f}")
-
-# ---------- MAIN: Summary of manual scenario ----------
-
-st.subheader("📊 Manual Scenario Summary")
+st.subheader("Model Summary")
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("ATS (manual)", f"{ats:.2f} km/h")
+    st.metric("Target ATS", f"{target_ats:.2f} km/h")
 with col2:
-    if t10k_actual_min and t10k_pred_min and t10k_pred_min > 0:
-        gap_10k_pct = (t10k_actual_min - t10k_pred_min) / t10k_pred_min * 100
-        st.metric("10K Gap", f"{gap_10k_pct:.1f} %")
-    else:
-        st.metric("10K Gap", "—")
+    st.metric("Estimated DF", f"{df_est:.3f}")
 with col3:
-    st.metric("DF (manual scenario)", f"{df_used_manual:.3f}")
-
-mpt_manual_min = predict_marathon_time_minutes(ats, df_used_manual)
-mpt_manual_str = minutes_to_hms_str(mpt_manual_min)
-if mpt_manual_min:
-    mp_pace_manual_minpkm = mpt_manual_min / 42.195
-    mp_pace_manual_str = minutes_per_km_to_pace_str(mp_pace_manual_minpkm)
-else:
-    mp_pace_manual_minpkm = None
-    mp_pace_manual_str = "—"
-
-colA, colB = st.columns(2)
-with colA:
-    st.metric("Marathon Prediction (manual)", mpt_manual_str)
-with colB:
-    st.metric("Marathon Pace (manual)", mp_pace_manual_str)
-
-st.divider()
-
-# ---------- WEEKLY WORKOUT PLANNER (SEGMENT-BASED BY SESSION) ----------
-
-st.subheader("🧩 Plan Weekly Workouts (Session-Based)")
+    st.metric("Marathon Prediction", format_min_to_hms(predicted_mar_min))
 
 st.markdown(
-    """
-Define your **weekly sessions** (distance + pace) and see:
-
-- Weekly km & hours  
-- ATS for the week  
-- km in each zone (Z1–Z5, relative to MP)  
-- DF + marathon prediction for the planned week
-"""
+    f"- **Marathon pace (MP)**: `{predicted_mar_pace}`  \n"
+    f"- We treat **ATS** as the main engine (~70% of your time), and **DF** as how well your training lets you *keep* that speed (~30%)."
 )
 
-num_workouts = st.number_input(
-    "Number of planned workouts this week",
-    min_value=1,
-    max_value=14,
-    value=5,
-    step=1,
-)
+# Compute MP speed and build weekly plan
+mp_speed = 42.195 / (predicted_mar_min / 60.0)
+week_df = expand_plan(plan_name, weekly_km, mp_speed)
+week_ats = compute_weekly_ats(week_df)
+zone_summary = summarize_zones(week_df)
 
-workouts = []
-total_plan_km = 0.0
-total_plan_min = 0.0
-
-for i in range(int(num_workouts)):
-    st.markdown(f"**Workout {i+1}**")
-    c1, c2, c3, c4 = st.columns([2, 2, 3, 2])
-
-    with c1:
-        name = st.text_input(f"Name {i+1}", value=f"Session {i+1}", key=f"name_{i}")
-    with c2:
-        dist_km = st.number_input(
-            f"Distance {i+1} (km)",
-            min_value=0.0,
-            value=10.0 if i == 0 else 8.0,
-            step=0.5,
-            key=f"dist_{i}",
-        )
-    with c3:
-        pace_str = st.text_input(
-            f"Pace {i+1} (m:ss or mm:ss /km)",
-            value="4:30" if i == 0 else "5:00",
-            key=f"pace_{i}",
-        )
-
-    pace_min = parse_time_to_minutes(pace_str)
-    if dist_km > 0 and pace_min and pace_min > 0:
-        dur_min = dist_km * pace_min  # minutes (pace is min/km)
-        total_plan_km += dist_km
-        total_plan_min += dur_min
-    else:
-        dur_min = None
-
-    zone = classify_zone(pace_min, mp_pace_minpkm) if mp_pace_minpkm else None
-    with c4:
-        st.write(f"Zone: **{zone}**" if zone else "Zone: —")
-
-    workouts.append(
-        {
-            "name": name,
-            "dist_km": dist_km,
-            "pace_str": pace_str,
-            "pace_min_per_km": pace_min,
-            "zone": zone,
-        }
-    )
-
-if total_plan_min > 0:
-    plan_hours = total_plan_min / 60.0
-    ats_plan = total_plan_km / plan_hours
-else:
-    plan_hours = None
-    ats_plan = None
+st.subheader(f"Weekly Plan – {plan_name}")
 
 st.markdown(
     f"""
-**Planned week totals**
+**Weekly distance**: `{weekly_km:.1f} km`  
+**Plan ATS (from these workouts)**: `{week_ats:.2f} km/h`  
 
-- Total distance: **{total_plan_km:.1f} km**  
-- Total time: **{plan_hours:.2f} h** (if all paces parsed)  
-- ATS (planned): **{ats_plan:.2f} km/h**  
-""" if ats_plan else
-    "_Enter valid distances and paces to see planned ATS._"
+If the plan ATS is below your target ATS of `{target_ats:.2f} km/h`,
+you can either **raise weekly km** slightly or **bump the ATS slider** and re-generate.
+"""
 )
 
-# ---------- Zone distribution for planned week ----------
+st.dataframe(week_df, hide_index=True)
 
-st.markdown("### 🧱 Planned km by zone (relative to MP)")
+st.subheader("Zone Breakdown (relative to MP)")
 
-zone_descriptions = {
-    "Z1": "Easy / Recovery (<85% MP speed)",
-    "Z2": "Steady / Aerobic (85–95% MP)",
-    "Z3": "MP / Sub-threshold (95–105% MP)",
-    "Z4": "Threshold / CV (105–115% MP)",
-    "Z5": "Faster than threshold (>115% MP)",
-}
+st.dataframe(zone_summary, hide_index=True)
 
-zone_km = {z: 0.0 for z in zone_descriptions.keys()}
+st.markdown(
+    """
+**Zone definitions (approx. as a % of MP speed):**
 
-for w in workouts:
-    z = w["zone"]
-    if z in zone_km and w["dist_km"] is not None:
-        zone_km[z] += w["dist_km"]
-
-if total_plan_km > 0:
-    table_md = "| Zone | Description | km | % of week |\n|---|---|---|---|\n"
-    for z in ["Z1", "Z2", "Z3", "Z4", "Z5"]:
-        km = zone_km[z]
-        pct = (km / total_plan_km * 100.0) if total_plan_km > 0 else 0.0
-        table_md += f"| {z} | {zone_descriptions[z]} | {km:.1f} | {pct:.1f}% |\n"
-    st.markdown(table_md)
-else:
-    st.info("Add distances and paces above to see km per zone.")
-
-st.divider()
-
-# ---------- DF & Marathon prediction for PLANNED scenario ----------
-
-st.subheader("📈 Planned vs Manual Scenario")
-
-df_plan = None
-mpt_plan_min = None
-mpt_plan_str = "—"
-mp_pace_plan_str = "—"
-
-if ats_plan:
-    df_plan = estimate_df_personal(ats_plan, t10k_actual_min, t10k_pred_min, annual_elev_m)
-    mpt_plan_min = predict_marathon_time_minutes(ats_plan, df_plan)
-    mpt_plan_str = minutes_to_hms_str(mpt_plan_min)
-    if mpt_plan_min:
-        mp_pace_plan_str = minutes_per_km_to_pace_str(mpt_plan_min / 42.195)
-
-colM, colP = st.columns(2)
-
-with colM:
-    st.markdown("### Manual scenario")
-    st.markdown(f"- **ATS:** {ats:.2f} km/h")
-    st.markdown(f"- **DF:** {df_used_manual:.3f}")
-    st.markdown(f"- **Marathon:** {mpt_manual_str}")
-    st.markdown(f"- **Pace:** {mp_pace_manual_str}")
-
-with colP:
-    st.markdown("### Planned-week scenario")
-    if ats_plan and df_plan and mpt_plan_min:
-        st.markdown(f"- **ATS:** {ats_plan:.2f} km/h")
-        st.markdown(f"- **DF (est.):** {df_plan:.3f}")
-        st.markdown(f"- **Marathon:** {mpt_plan_str}")
-        st.markdown(f"- **Pace:** {mp_pace_plan_str}")
-    else:
-        st.markdown("_Enter valid workouts to compute planned scenario._")
-
-st.divider()
-
-st.subheader("🔍 How DF is being estimated")
-
-if t10k_actual_min and t10k_pred_min and t10k_pred_min > 0:
-    gap_10k = (t10k_actual_min - t10k_pred_min) / t10k_pred_min
-    gap_10k_pct = gap_10k * 100
-
-    if ats_plan and df_plan:
-        st.markdown(
-            f"""
-**10K gap**
-
-- Actual 10K: `{t10k_actual_str}`  
-- Predicted 10K: `{t10k_pred_str}`  
-- Gap = **{gap_10k_pct:.1f}% slower** than predicted  
-
-**DF model**
-
-> `DF = 1.768 - 0.049·ATS - 0.0000069·Elev_year + 0.118·Gap_10k`
-
-(where `Gap_10k` is in fractional form, e.g. 0.10 = 10%)
-
-- Annual elevation = `{annual_elev_m:,.0f}` m  
-
-**Manual ATS scenario**
-
-- ATS = `{ats:.2f}` km/h → DF ≈ **{df_est_manual:.3f}** (before any override)
-
-**Planned-week scenario**
-
-- ATS (planned) = `{ats_plan:.2f}` km/h → DF ≈ **{df_plan:.3f}**
+- `Z1` – Easy / Recovery: **70–80%** of MP speed  
+- `Z2` – Steady Aerobic: **80–90%** of MP speed  
+- `Z3` – Marathon / Sub-threshold: **95–105%** of MP speed  
+- `Z4` – Threshold / CV: **105–115%** of MP speed  
+- `Z5` – Intervals / Speed: **>115%** of MP speed  
 """
-        )
-    else:
-        st.markdown(
-            f"""
-**10K gap**
+)
 
-- Actual 10K: `{t10k_actual_str}`  
-- Predicted 10K: `{t10k_pred_str}`  
-- Gap = **{gap_10k_pct:.1f}% slower** than predicted  
+st.subheader("How the Durability (DF) Piece Works")
 
-**DF model**
+st.markdown(
+    f"""
+We estimate **DF** using two ingredients:
 
-> `DF = 1.768 - 0.049·ATS - 0.0000069·Elev_year + 0.118·Gap_10k`
+1. **10K → Marathon decay**  
+   - Compare your **real marathon time** to a Riegel-style prediction from your 10K.  
+   - If you slow down **less** than typical, DF > 1.0 (super durable).  
+   - If you slow down **more**, DF < 1.0 (fade risk).
 
-- Annual elevation = `{annual_elev_m:,.0f}` m  
-- Manual ATS = `{ats:.2f}` km/h → DF ≈ **{df_est_manual:.3f}**
+2. **Annual volume effect (around ~6000 km/year)**  
+   - ~6000 km/year → neutral volume effect  
+   - Much higher volume (e.g. **Kelvin Kiptum level**) → DF nudged **up**  
+   - Much lower volume (e.g. **4k/year Adam-style**) → DF nudged **down**  
+
+Finally, marathon time is modeled as:
+
+\\[
+\\text{{MPT (min)}} = \\frac{{4666 \\cdot ATS^{{-1.33}}}}{{DF}} + 8
+\\]
+
+So:
+- Raise **ATS** → faster marathon (bigger effect, ~70%)  
+- Improve **DF** (better decay + smarter volume) → more time shaved off (~30%)  
 """
-        )
-else:
-    st.info("Enter valid 10K actual & predicted times in the sidebar to see DF details.")
-
-st.caption(
-    "Use the workout planner to experiment: more Z3–Z4 at a sustainable ATS should tighten your 10K gap over time, "
-    "nudging DF toward ~0.95–1.00 and improving the marathon prediction."
 )
