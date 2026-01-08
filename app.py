@@ -428,11 +428,7 @@ We estimate **DF** using two ingredients:
    - Much higher volume (e.g. **Kelvin Kiptum level**) → DF nudged **up**  
    - Much lower volume (e.g. **4k/year Adam-style**) → DF nudged **down**  
 
-Finally, marathon time is modeled as:
-
-\\[
-\\text{{MPT (min)}} = \\frac{{4666 \\cdot ATS^{{-1.33}}}}{{DF}} + 8
-\\]
+Finally, marathon time is modeled as a power law of Average Training speed adjusted for durability.
 
 So:
 - Raise **ATS** → faster marathon (bigger effect, ~70%)  
